@@ -1,0 +1,477 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Pausable.sol";
+
+/**
+ * @title GenericToken
+ * @dev A generic ERC20 token with EIP-2612 (permit) functionality,
+ * enhanced security features, and comprehensive access controls.
+ *
+ * Features:
+ * - ERC20 standard implementation
+ * - EIP-2612 permit functionality (gasless approvals)
+ * - Ownable access control
+ * - Pausable functionality
+ * - Burnable tokens
+ * - Role-based operations
+ * - Emergency controls
+ * - Comprehensive events for monitoring
+ */
+contract GenericToken is ERC20, ERC20Permit, ERC20Burnable, ERC20Pausable, Ownable {
+
+    // ============ Events ============
+
+    /**
+     * @dev Emitted when tokens are minted
+     */
+    event TokensMinted(address indexed to, uint256 amount);
+
+    /**
+     * @dev Emitted when the contract is paused
+     */
+    event ContractPaused(address indexed by);
+
+    /**
+     * @dev Emitted when the contract is unpaused
+     */
+    event ContractUnpaused(address indexed by);
+
+    /**
+     * @dev Emitted when a new minter is added
+     */
+    event MinterAdded(address indexed minter);
+
+    /**
+     * @dev Emitted when a minter is removed
+     */
+    event MinterRemoved(address indexed minter);
+
+    /**
+     * @dev Emitted when emergency functions are triggered
+     */
+    event EmergencyAction(address indexed by, string action);
+
+    // ============ State Variables ============
+
+    /**
+     * @dev Mapping of addresses that have minting privileges
+     */
+    mapping(address => bool) private _minters;
+
+    /**
+     * @dev Maximum supply cap (18 million tokens with 18 decimals)
+     */
+    uint256 public constant MAX_SUPPLY = 18_000_000 * 10**18;
+
+    /**
+     * @dev Daily minting limit to prevent spam attacks
+     */
+    uint256 public constant DAILY_MINT_LIMIT = 1_000_000 * 10**18;
+
+    /**
+     * @dev Tracking of daily minted amounts
+     */
+    mapping(uint256 => uint256) private _dailyMinted;
+
+    /**
+     * @dev Blacklist for malicious addresses
+     */
+    mapping(address => bool) private _blacklisted;
+
+    /**
+     * @dev Emergency flag for critical situations
+     */
+    bool private _emergencyMode;
+
+    // ============ Modifiers ============
+
+    /**
+     * @dev Restricts function to minters only
+     */
+    modifier onlyMinter() {
+        require(_minters[msg.sender] || msg.sender == owner(), "GenericToken: Caller is not a minter");
+        _;
+    }
+
+    /**
+     * @dev Prevents blacklisted addresses from executing functions
+     */
+    modifier notBlacklisted() {
+        require(!_blacklisted[msg.sender], "GenericToken: Caller is blacklisted");
+        _;
+    }
+
+    /**
+     * @dev Ensures recipient is not blacklisted
+     */
+    modifier recipientNotBlacklisted(address to) {
+        require(!_blacklisted[to], "GenericToken: Recipient is blacklisted");
+        _;
+    }
+
+    /**
+     * @dev Checks daily minting limit
+     */
+    modifier respectsDailyLimit(uint256 amount) {
+        uint256 today = block.timestamp / 1 days;
+        uint256 dailyTotal = _dailyMinted[today] + amount;
+        require(dailyTotal <= DAILY_MINT_LIMIT, "GenericToken: Daily mint limit exceeded");
+        _;
+        _dailyMinted[today] = dailyTotal;
+    }
+
+    /**
+     * @dev Only callable when not in emergency mode
+     */
+    modifier notEmergencyMode() {
+        require(!_emergencyMode, "GenericToken: Contract in emergency mode");
+        _;
+    }
+
+    // ============ Constructor ============
+
+    /**
+     * @dev Initializes the token with name, symbol, and initial supply
+     * @param name The token name
+     * @param symbol The token symbol
+     * @param initialSupply Initial tokens to mint for the owner
+     */
+    constructor(
+        string memory name,
+        string memory symbol,
+        uint256 initialSupply
+    ) ERC20(name, symbol) ERC20Permit(name) Ownable(msg.sender) {
+        require(initialSupply <= MAX_SUPPLY, "GenericToken: Initial supply exceeds max supply");
+
+        if (initialSupply > 0) {
+            _mint(msg.sender, initialSupply);
+            emit TokensMinted(msg.sender, initialSupply);
+        }
+
+        // Owner is automatically a minter
+        _minters[msg.sender] = true;
+        emit MinterAdded(msg.sender);
+    }
+
+    // ============ External Functions ============
+
+    /**
+     * @dev Mints new tokens to the specified address
+     * @param to The address to mint tokens to
+     * @param amount The amount of tokens to mint
+     */
+    function mint(
+        address to,
+        uint256 amount
+    )
+        external
+        onlyMinter
+        notBlacklisted
+        recipientNotBlacklisted(to)
+        respectsDailyLimit(amount)
+        notEmergencyMode
+    {
+        require(to != address(0), "GenericToken: Cannot mint to zero address");
+        require(totalSupply() + amount <= MAX_SUPPLY, "GenericToken: Max supply exceeded");
+
+        _mint(to, amount);
+        emit TokensMinted(to, amount);
+    }
+
+    /**
+     * @dev Burns tokens from the caller's account
+     * @param amount The amount of tokens to burn
+     */
+    function burn(uint256 amount)
+        public
+        override
+        notBlacklisted
+        notEmergencyMode
+    {
+        super.burn(amount);
+    }
+
+    /**
+     * @dev Burns tokens from a specified account
+     * @param account The account to burn from
+     * @param amount The amount of tokens to burn
+     */
+    function burnFrom(address account, uint256 amount)
+        public
+        override
+        notBlacklisted
+        notEmergencyMode
+    {
+        super.burnFrom(account, amount);
+    }
+
+    /**
+     * @dev Transfers tokens between addresses
+     * @param to The recipient address
+     * @param amount The amount to transfer
+     * @return bool True if successful
+     */
+    function transfer(address to, uint256 amount)
+        public
+        override
+        notBlacklisted
+        recipientNotBlacklisted(to)
+        notEmergencyMode
+        returns (bool)
+    {
+        return super.transfer(to, amount);
+    }
+
+    /**
+     * @dev Transfers tokens from one address to another
+     * @param from The sender address
+     * @param to The recipient address
+     * @param amount The amount to transfer
+     * @return bool True if successful
+     */
+    function transferFrom(address from, address to, uint256 amount)
+        public
+        override
+        notBlacklisted
+        recipientNotBlacklisted(to)
+        notEmergencyMode
+        returns (bool)
+    {
+        return super.transferFrom(from, to, amount);
+    }
+
+    /**
+     * @dev Approves spending of tokens with additional safety checks
+     * @param spender The address to approve
+     * @param amount The amount to approve
+     * @return bool True if successful
+     */
+    function approve(address spender, uint256 amount)
+        public
+        override
+        notBlacklisted
+        notEmergencyMode
+        returns (bool)
+    {
+        return super.approve(spender, amount);
+    }
+
+    /**
+     * @dev Permits spending of tokens via signature (EIP-2612)
+     * @param owner The token owner
+     * @param spender The approved spender
+     * @param value The amount to approve
+     * @param deadline The deadline for the signature
+     * @param v Recovery parameter
+     * @param r Recovery parameter
+     * @param s Recovery parameter
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    )
+        public
+        override
+        notEmergencyMode
+    {
+        super.permit(owner, spender, value, deadline, v, r, s);
+    }
+
+    /**
+     * @dev Pauses all token transfers and operations
+     */
+    function pause() external onlyOwner {
+        _pause();
+        emit ContractPaused(msg.sender);
+    }
+
+    /**
+     * @dev Unpauses all token transfers and operations
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+        emit ContractUnpaused(msg.sender);
+    }
+
+    /**
+     * @dev Adds a new minter
+     * @param minter The address to add as minter
+     */
+    function addMinter(address minter) external onlyOwner {
+        require(minter != address(0), "GenericToken: Cannot add zero address as minter");
+        require(!_minters[minter], "GenericToken: Address is already a minter");
+
+        _minters[minter] = true;
+        emit MinterAdded(minter);
+    }
+
+    /**
+     * @dev Removes a minter
+     * @param minter The address to remove as minter
+     */
+    function removeMinter(address minter) external onlyOwner {
+        require(_minters[minter], "GenericToken: Address is not a minter");
+        require(minter != owner(), "GenericToken: Cannot remove owner as minter");
+
+        _minters[minter] = false;
+        emit MinterRemoved(minter);
+    }
+
+    /**
+     * @dev Blacklists an address from using the token
+     * @param account The address to blacklist
+     */
+    function blacklist(address account) external onlyOwner {
+        require(account != address(0), "GenericToken: Cannot blacklist zero address");
+        require(account != owner(), "GenericToken: Cannot blacklist owner");
+
+        _blacklisted[account] = true;
+        emit EmergencyAction(msg.sender, "BLACKLIST");
+    }
+
+    /**
+     * @dev Removes an address from the blacklist
+     * @param account The address to unblacklist
+     */
+    function unblacklist(address account) external onlyOwner {
+        _blacklisted[account] = false;
+        emit EmergencyAction(msg.sender, "UNBLACKLIST");
+    }
+
+    /**
+     * @dev Activates emergency mode, restricting most operations
+     */
+    function activateEmergencyMode() external onlyOwner {
+        _emergencyMode = true;
+        emit EmergencyAction(msg.sender, "EMERGENCY_MODE_ACTIVATED");
+    }
+
+    /**
+     * @dev Deactivates emergency mode
+     */
+    function deactivateEmergencyMode() external onlyOwner {
+        _emergencyMode = false;
+        emit EmergencyAction(msg.sender, "EMERGENCY_MODE_DEACTIVATED");
+    }
+
+    /**
+     * @dev Emergency function to transfer tokens from any account (in case of lost keys)
+     * Only usable in emergency mode and requires owner privileges
+     * @param from The address to transfer from
+     * @param to The address to transfer to
+     * @param amount The amount to transfer
+     */
+    function emergencyTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) external onlyOwner {
+        require(_emergencyMode, "GenericToken: Not in emergency mode");
+        require(to != address(0), "GenericToken: Cannot transfer to zero address");
+
+        _transfer(from, to, amount);
+        emit EmergencyAction(msg.sender, "EMERGENCY_TRANSFER");
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @dev Checks if an address is a minter
+     * @param account The address to check
+     * @return bool True if the address is a minter
+     */
+    function isMinter(address account) external view returns (bool) {
+        return _minters[account];
+    }
+
+    /**
+     * @dev Checks if an address is blacklisted
+     * @param account The address to check
+     * @return bool True if the address is blacklisted
+     */
+    function isBlacklisted(address account) external view returns (bool) {
+        return _blacklisted[account];
+    }
+
+    /**
+     * @dev Checks if the contract is in emergency mode
+     * @return bool True if in emergency mode
+     */
+    function emergencyMode() external view returns (bool) {
+        return _emergencyMode;
+    }
+
+    /**
+     * @dev Gets the amount minted today
+     * @return uint256 Amount minted today
+     */
+    function dailyMinted() external view returns (uint256) {
+        uint256 today = block.timestamp / 1 days;
+        return _dailyMinted[today];
+    }
+
+    /**
+     * @dev Gets the remaining daily mint limit
+     * @return uint256 Remaining daily limit
+     */
+    function remainingDailyLimit() external view returns (uint256) {
+        uint256 today = block.timestamp / 1 days;
+        return DAILY_MINT_LIMIT - _dailyMinted[today];
+    }
+
+    /**
+     * @dev Gets the maximum supply
+     * @return uint256 Maximum supply
+     */
+    function maxSupply() external pure returns (uint256) {
+        return MAX_SUPPLY;
+    }
+
+    // ============ Internal Functions ============
+
+    
+    /**
+     * @dev Override the _update function to resolve conflict between ERC20 and ERC20Pausable
+     */
+    function _update(address from, address to, uint256 amount)
+        internal
+        override(ERC20, ERC20Pausable)
+    {
+        super._update(from, to, amount);
+    }
+
+    /**
+     * @dev Returns the version string for EIP-712 signature
+     * @return string The version string
+     */
+    function version() external pure returns (string memory) {
+        return "1";
+    }
+
+    /**
+     * @dev Returns the EIP-712 domain separator
+     * @return bytes32 The domain separator
+     */
+    function DOMAIN_SEPARATOR() external view override returns (bytes32) {
+        return _domainSeparatorV4();
+    }
+
+    /**
+     * @dev Returns the current nonce for an owner
+     * @param owner The address to query
+     * @return uint256 The current nonce
+     */
+    function nonces(address owner) public view override returns (uint256) {
+        return super.nonces(owner);
+    }
+}
